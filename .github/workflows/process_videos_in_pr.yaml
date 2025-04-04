@@ -1,0 +1,232 @@
+# .github/workflows/process_videos_in_pr.yaml
+ 
+name: Find GitHub Attachment URLs in PR Description
+ 
+# Trigger on pull requests being opened or when new commits are pushed
+on:
+  pull_request:
+    types: [opened, synchronize]
+ 
+concurrency:
+  group: process-videos-${{ github.ref }}
+  cancel-in-progress: true
+ 
+jobs:
+  find_attachment_urls_in_pr:
+    runs-on: general-nano-arm-v2
+    # Define permissions required by the job
+    permissions:
+      contents: read      # To checkout the code
+      pull-requests: read # To access PR data
+ 
+    steps:
+      # Step 1: Check out the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      # Step 2: Set up Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+ 
+      # Step 3: Install Python dependencies
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+      # Step 4: Extract URLs and try different authentication methods to get MIME types
+      - name: Extract URLs and get MIME types
+        id: get_mime_types
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        shell: python
+        run: |
+          import os
+          import re
+          import sys
+          import requests
+          import json
+          import time
+          print("Looking for GitHub attachment URLs in PR description...")
+          # Get environment variables
+          github_token = os.environ.get('GITHUB_TOKEN', '')
+          pr_number = os.environ.get('PR_NUMBER', '')
+          repo = os.environ.get('REPO', '')
+          if not all([github_token, pr_number, repo]):
+              print("Missing required environment variables")
+              sys.exit(1)
+          # Split repo into owner and repo name
+          owner, repo_name = repo.split('/')
+          # Use GitHub API to get PR description
+          api_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}"
+          headers = {
+              'Authorization': f'token {github_token}',
+              'Accept': 'application/vnd.github.v3+json'
+          }
+          print(f"Fetching PR data from GitHub API: {api_url}")
+          try:
+              response = requests.get(api_url, headers=headers)
+              response.raise_for_status()
+              pr_data = response.json()
+              pr_body = pr_data.get('body', '')
+              if not pr_body:
+                  print("PR description is empty or could not be retrieved.")
+                  sys.exit(0)
+              # Find attachment URLs
+              attachment_pattern = r'https://github\.com/user-attachments/assets/[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}'
+              attachment_urls = re.findall(attachment_pattern, pr_body, re.IGNORECASE)
+              if not attachment_urls:
+                  print("No attachment URLs found in PR description.")
+                  sys.exit(0)
+              # Get unique URLs
+              unique_urls = list(set(attachment_urls))
+              print(f"Found {len(unique_urls)} unique attachment URL(s).")
+              # Try different authentication methods for each URL
+              for url in unique_urls:
+                  print(f"\nProcessing URL: {url}")
+ 
+                  # Extract UUID for reference
+                  uuid_match = re.search(r'[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}', url)
+                  uuid = uuid_match.group(0) if uuid_match else "unknown"
+                  print(f"Asset UUID: {uuid}")
+ 
+                  # Method 1: Try with GitHub token in Authorization header
+                  print("Method 1: Using GitHub token with Authorization header")
+                  auth_headers = {
+                      'Authorization': f'token {github_token}',
+                      'User-Agent': 'GitHub-Actions-MIME-Type-Detector',
+                      'Accept': '*/*'
+                  }
+ 
+                  try:
+                      # Use HEAD request first (more efficient)
+                      head_response = requests.head(url, headers=auth_headers, timeout=10, allow_redirects=True)
+                      print(f"HEAD response status: {head_response.status_code}")
+ 
+                      if head_response.status_code == 200:
+                          mime_type = head_response.headers.get('Content-Type', 'Unknown')
+                          print(f"MIME Type: {mime_type}")
+                          continue  # Success! Move to next URL
+ 
+                      # If HEAD failed, try GET instead (some servers only accept GET)
+                      get_response = requests.get(url, headers=auth_headers, timeout=10, stream=True, allow_redirects=True)
+                      print(f"GET response status: {get_response.status_code}")
+ 
+                      if get_response.status_code == 200:
+                          mime_type = get_response.headers.get('Content-Type', 'Unknown')
+                          print(f"MIME Type: {mime_type}")
+                          # Close the stream without downloading everything
+                          get_response.close()
+                          continue  # Success! Move to next URL
+                      else:
+                          print(f"Both HEAD and GET requests failed with GitHub token")
+ 
+                  except Exception as e:
+                      print(f"Error with Method 1: {str(e)}")
+ 
+                  # Method 2: Try with different Authorization prefix (Bearer instead of token)
+                  print("Method 2: Using Bearer token prefix")
+                  bearer_headers = {
+                      'Authorization': f'Bearer {github_token}',
+                      'User-Agent': 'GitHub-Actions-MIME-Type-Detector',
+                      'Accept': '*/*'
+                  }
+ 
+                  try:
+                      response = requests.head(url, headers=bearer_headers, timeout=10, allow_redirects=True)
+                      print(f"HEAD response status: {response.status_code}")
+ 
+                      if response.status_code == 200:
+                          mime_type = response.headers.get('Content-Type', 'Unknown')
+                          print(f"MIME Type: {mime_type}")
+                          continue  # Success! Move to next URL
+                  except Exception as e:
+                      print(f"Error with Method 2: {str(e)}")
+ 
+                  # Method 3: Try without Authorization header (maybe public access?)
+                  print("Method 3: Trying without Authorization")
+                  no_auth_headers = {
+                      'User-Agent': 'GitHub-Actions-MIME-Type-Detector',
+                      'Accept': '*/*'
+                  }
+ 
+                  try:
+                      response = requests.head(url, headers=no_auth_headers, timeout=10, allow_redirects=True)
+                      print(f"HEAD response status: {response.status_code}")
+ 
+                      if response.status_code == 200:
+                          mime_type = response.headers.get('Content-Type', 'Unknown')
+                          print(f"MIME Type: {mime_type}")
+                          continue  # Success! Move to next URL
+                  except Exception as e:
+                      print(f"Error with Method 3: {str(e)}")
+ 
+                  # Method 4: Use a custom approach to handle cookies or session if needed
+                  print("Method 4: Using requests session with cookies")
+                  try:
+                      session = requests.Session()
+                      # Get the GitHub homepage first to obtain any necessary cookies
+                      session.get('https://github.com/')
+                      session.headers.update({
+                          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                          'Accept': '*/*'
+                      })
+ 
+                      response = session.head(url, timeout=10, allow_redirects=True)
+                      print(f"Session HEAD response status: {response.status_code}")
+ 
+                      if response.status_code == 200:
+                          mime_type = response.headers.get('Content-Type', 'Unknown')
+                          print(f"MIME Type: {mime_type}")
+                          continue  # Success! Move to next URL
+ 
+                      # Last resort: try GET instead of HEAD
+                      response = session.get(url, timeout=10, stream=True, allow_redirects=True)
+                      print(f"Session GET response status: {response.status_code}")
+ 
+                      if response.status_code == 200:
+                          mime_type = response.headers.get('Content-Type', 'Unknown')
+                          print(f"MIME Type: {mime_type}")
+                          response.close()
+                      else:
+                          print(f"All methods failed for URL: {url}")
+                          print("Unable to determine MIME type directly. This might require manual inspection.")
+                  except Exception as e:
+                      print(f"Error with Method 4: {str(e)}")
+                      print("All methods failed to determine MIME type.")
+ 
+                  # Wait a bit between URLs to avoid rate limiting
+                  time.sleep(1)
+ 
+          except Exception as e:
+              print(f"Error: {str(e)}")
+              print(f"Error type: {type(e).__name__}")
+              sys.exit(1)
+ 
+          print("\n=== URL Processing Completed ===")
+      # --- Steps below remain commented out ---
+ 
+      # # Step 5: Run your Python script on each downloaded video (COMMENTED OUT)
+      # - name: Run Video Processing Script
+      #   id: process
+      #   run: |
+      #     echo "[Skipped] Video processing step was commented out."
+ 
+      # # Step 6: Comment results back to the Pull Request (COMMENTED OUT)
+      # - name: Comment Results on PR
+      #   uses: actions/github-script@v7
+      #   with:
+      #     github-token: ${{ secrets.GITHUB_TOKEN }}
+      #     script: |
+      #       console.log("[Skipped] Commenting step was commented out.");
+ 
+      # # Step 7: Upload the full processing log as an artifact (COMMENTED OUT)
+      # - name: Upload Processing Log Artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: video-processing-log-${{ github.run_id }}
+      #     if-no-files-found: ignore
+      #     retention-days: 1
